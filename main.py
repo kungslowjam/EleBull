@@ -1,10 +1,16 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+import os
 import cv2
-from ultralytics import YOLO
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from concurrent.futures import ProcessPoolExecutor
+from ultralytics import YOLO
 import asyncio
+import time
 
 app = FastAPI()
+
+# Set OpenCV logging level to suppress warnings
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"  # This will suppress warnings and only show errors
 
 # CORS configuration
 app.add_middleware(
@@ -18,14 +24,37 @@ app.add_middleware(
 # Load YOLOv8 model
 model = YOLO("yolov8n.pt")
 
-# Check and list available cameras
-def get_available_cameras(max_index=5):
-    cameras = []
-    for index in range(max_index):
-        cap = cv2.VideoCapture(index)
-        if cap.isOpened():
-            cameras.append({"label": f"Camera {index}", "index": index})
+# Cache for camera list with expiration time
+camera_cache = None
+cache_expiry_time = 300  # Cache lasts for 5 minutes
+
+# Function to check if a camera is available at a given index
+def check_camera(index):
+    cap = cv2.VideoCapture(index)
+    if cap.isOpened():
+        label = f"Camera {index}"
         cap.release()
+        return {"label": label, "index": index}
+    return None
+
+# Optimized function to find available cameras with caching
+def get_available_cameras(max_index=3):
+    global camera_cache
+    
+    # Check if cache is still valid
+    current_time = time.time()
+    if camera_cache and (current_time - camera_cache['timestamp'] < cache_expiry_time):
+        return camera_cache['cameras']
+    
+    cameras = []
+    with ProcessPoolExecutor() as executor:
+        results = executor.map(check_camera, range(max_index))
+    
+    cameras = [cam for cam in results if cam]
+    camera_cache = {
+        "cameras": cameras,
+        "timestamp": current_time
+    }
     return cameras
 
 # Endpoint to send available cameras to frontend
@@ -51,11 +80,11 @@ async def websocket_endpoint(websocket: WebSocket, camera: int = Query(0)):
                 print(f"Failed to read frame from camera {camera}.")
                 break
 
-            # Object detection using YOLOv8
+            # Perform object detection using YOLO
             results = model(frame)
             annotated_frame = results[0].plot()
 
-            # Encode the image as JPEG
+            # Encode the annotated frame as JPEG
             _, buffer = cv2.imencode('.jpg', annotated_frame)
             frame_bytes = buffer.tobytes()
 
@@ -65,9 +94,10 @@ async def websocket_endpoint(websocket: WebSocket, camera: int = Query(0)):
                 print(f"Client disconnected from camera {camera}")
                 break
 
-            # Add delay to control the frame rate
+            # Control frame rate
             await asyncio.sleep(0.03)
 
     finally:
         cap.release()
         await websocket.close()
+    
